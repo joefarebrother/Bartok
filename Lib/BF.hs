@@ -31,16 +31,8 @@ withPlayer f act e gs = act e gs
 withHand :: ([Card] -> Rule) -> Rule
 withHand f = withPlayer $ \p -> with state $ \gs -> f (maybe [] id $ getHand p gs)
 
-{-
--- copied from TLib
-penalty :: Int -> String -> Game
-penalty n reason (Action p a m) = draw n p . broadcast ("{} receives penalty {}: {}"%p%show n%reason)
-penalty _ _ _ = id
--}
-
 (!) :: Show a => VarName -> a -> VarName 
 n ! x = n ++ "_" ++ show x
-
 
 copyVar :: VarName -> VarName -> Step
 copyVar from to gs = setVar to (readVar from gs) gs
@@ -66,25 +58,53 @@ copyStack from to gs =
 
 -- manipulating the interpreting player (i.e. managing a player-valued variable) --
 
-setIntrPlayer :: Name -> Step
-setIntrPlayer p = setVar ("BF_intpr_player_" ++ p) 1 . clearIntrPlayer
+{-
+Invariants:
+1. At most one of the variables prefixed BF_intpr_player_ may be set
+2. Exactly one intpr_player variable must be set if and only if code is being interpreted, i.e. the value at the pc is nonzero
+3. BF_input and BF_output may only be set when code is being interpreted, and only at most one may be set
 
-clearIntrPlayer :: Step
-clearIntrPlayer gs = foldr ($) gs [setVar ("BF_intpr_player_" ++ p) 0 | p <- _players gs] 
+1 is held because setIntrpPlayer clears interpPlayer first (though if it didn't, the invariant still holds)
+2 is held because it's only set by rCards when a program is extended, and only cleared by rInterpret when one stops running
+3 is held because they're only set by rInterpret, and only cleared by rInput, rOutput, and restoreBackup
+-}
 
-getIntrPlayer :: GEGSto Name
-getIntrPlayer _ _ gs = case filter check $ _players gs of
+setIntprPlayer :: Name -> Step
+setIntprPlayer p = setVar ("BF_intpr_player_" ++ p) 1 . clearIntprPlayer
+
+clearIntprPlayer :: Step
+clearIntprPlayer gs = foldr ($) gs [setVar ("BF_intpr_player_" ++ p) 0 | p <- _players gs] 
+
+-- crashes when there isn't one
+-- everywhere that calls it already knows that BF_input or BF_output is set
+getIntprPlayer :: GEGSto Name
+getIntprPlayer _ _ gs = case filter check $ _players gs of
     [] -> error "Expected there to be an interpeting player!"
     [p] -> p
     _ -> error "Interpreting player in an inconsistent state!"
-    where check p = readVar "BF_intr_player" gs /= 0
+    where check p = readVar ("BF_intpr_player_" ++ p) gs /= 0
 
--- checks the player making this action
-isIntrPlayer :: GEGSto Bool
-isIntrPlayer act e@(Action p _ _) gs = boolVar ("BF_intr_player_" ++ p) act e gs
-inIntrPlayer _ _ _ = False
+-- checks the player making this action. does not require there to be an interpreting player.
+isIntprPlayer :: GEGSto Bool
+isIntprPlayer act e@(Action p _ _) gs = boolVar ("BF_intpr_player_" ++ p) act e gs
+inIntprPlayer act e gs = False
 
 -- rules --
+
+rCatchEvents :: Rule
+rCatchEvents act e@Timeout gs = 
+    ( (when (boolVar "BF_input") $
+         with getIntprPlayer $ \p -> doOnly $ broadcast ("Penalize {} 1 card for failure to input within a reasonable amount of time"%p) . draw 1 p)
+    . (when (boolVar ("BF_output")) $
+         with getIntprPlayer $ \p -> doOnly $ broadcast ("Penalize {} 1 card for failure to output within a reasonable amount of time"%p) . draw 1 p)
+    ) act e gs
+rCatchEvents act e@(PlayerLeave p) gs = 
+    (when (boolVar ("BF_intpr_player_" ++ p)) $ 
+        with (_players .: state) $ \ps ->
+        case filter (/= p) ps of
+            (p':ps) -> doBefore $ broadcast ("{} is now the intepreting player" % p') . setIntprPlayer p'
+            [] -> doBefore $ restoreBackup . broadcast "No players left! Restoring to previous backup of the program state") act e gs
+rCatchEvents act e gs = act e gs
 
 rSetup :: Rule
 rSetup = when (not_$ boolVar "BF_setup") (doBefore$ 
@@ -117,10 +137,9 @@ rCards = withCard $ \c ->
         Jack -> write ']'
         _ -> id
     where write c = with (getVar "BF_prog_end") $ \end -> 
-                        withPlayer (\p -> doBefore$ setIntrPlayer p)
+                        withPlayer (\p -> doBefore$ setIntprPlayer p)
                       . doBefore ( setVar ("BF_prog" ! end) (bfToNum c) 
                                 . modifyVar ("BF_prog_end") (+1)
-                             -- . setVar "BF_timeout" 100 -- we now timeout each loop individually
                                 . copyMem "BF_mem" "BF_mem_backup" -- backup everything so it can be restored on an abort
                                 . copyVar "BF_pc" "BF_pc_backup"
                                 . copyStack "BF_stack" "BF_stack_backup"
@@ -133,14 +152,14 @@ restoreBackup gs = let gs' = ( copyMem "BF_mem_backup" "BF_mem"
                              . modifyVar "BF_prog_end" (subtract 1)
                              . copyStack "BF_stack_backup" "BF_stack"
                              . setVar "BF_input" 0
-                             . setVar "BF_output" 1
+                             . setVar "BF_output" 0
                              ) gs 
                    in setVar ("BF_prog" ! (readVar "BF_prog_end" gs')) 0 gs'
 
 
 rInterpret :: Rule
 rInterpret = 
-    withAction $ \_ -> -- don't trigger on timeouts
+    withAction $ \_ -> -- don't trigger on timeouts and similar
     when (not_ (boolVar "BF_input") ~&~ not_ (boolVar "BF_output")) $
     with (getVar "BF_pc") $ \pc ->
     whether (boolVar$ "BF_prog" ! pc) ( -- stop interpreting when we run out of program
@@ -163,7 +182,7 @@ rInterpret =
                       '[' -> pushLoop pc . doBefore (setVar "BF_skip" (if mem == 0 then pc else 0)) . rInterpret
                       ']' -> popLoop $ \l -> whether (__$ mem/=0) (doBefore (setVar "BF_pc" l) . tickTimeout l) (clearTimeout l) . rInterpret
                       _ -> error "Expected a valid program"))
-    ) {-else-} (doBefore clearIntrPlayer)
+    ) {-else-} (doBefore clearIntprPlayer)
 
 pushLoop :: Int -> Rule
 pushLoop l = with (getVar "BF_stack_pointer") $ \sp -> 
@@ -171,9 +190,8 @@ pushLoop l = with (getVar "BF_stack_pointer") $ \sp ->
            . doBefore (modifyVar "BF_stack_pointer" (+1))
 
 popLoop :: (Int -> Rule) -> Rule
-popLoop f = doBefore (modifyVar "BF_timeout" (subtract 1)) 
-          . doBefore (modifyVar "BF_stack_pointer" (subtract 1)) 
-          . with (getVar "BF_stack_pointer") ( \sp ->
+popLoop f = doBefore (modifyVar "BF_stack_pointer" (subtract 1)) 
+          . with (getVar "BF_stack_pointer") (\sp ->
             when (__$ sp < 0) ((doBefore$ modifyVar "BF_stack_pointer" (+1)) . (abort 1 "Syntax error"))
           . with (getVar$ "BF_stack" ! sp) f)
 
@@ -187,77 +205,35 @@ clearTimeout l = doBefore (setVar ("BF_stack_timeout" ! l) 0)
 abort :: Int -> String -> Rule
 abort n reason = doBefore restoreBackup . doOnly (illegal n reason)
 
+-- this could cause a card to be duplicated if they were outputting ...
 rAbort :: Rule
 rAbort = 
-    when isTurn $
     when (said "ABORT") $
+    when isIntprPlayer $
     abort 4 "Manual abort"
 
 giveOutputCard :: Rule
 giveOutputCard = 
-    with getIntrPlayer $ \p ->
+    with getIntprPlayer $ \p ->
     with (numToCard .: getVar "BF_output_card") $ \c ->
     doBefore (\gs -> gs{_deck = c:_deck gs})
-  . doBefore (draw1 p) 
+  . doBefore (draw 1 p) 
 
 -- Input and output --
 
-{-
-rPrepareIO :: Rule
-rPrepareIO = 
-   {- (when (boolVar "BF_input") $
-       withPlayer $ \p-> 
-       when isLegal $
-       keepTurn p 
-     . withHand (\h ->
-         if length h <= 1 then doBefore ((draw1 p) . (broadcast$ "{} has too few cards to input, so draws 1"%p))
-         else id))
-  .-} (when (boolVar "BF_output") $ 
-       with getIntrPlayer $ \p -> 
-       when isLegal $
-       keepTurn p 
-     . with (numToCard .: getVar "BF_output_card") (\c ->
-       doBefore (\gs -> gs{_deck = c:_deck gs})
-     . doBefore (draw1 p)))  -- put the required card in their hand
-  {-. (when (boolVar "BF_player_shift") $ -- restore player order that was messed with on the previous turn. Gets applied before we possibly mess with it again this turn.
-       with (getVar "BF_player_shift") $ \n -> 
-       when isLegal $
-       doBefore (setVar "BF_player_shift" 0)
-     . doAfter (modifyPlayers $ \ps ->
-       let (l,r) = splitAt (n`mod`length ps) ps 
-       in r++l)) -}
-       
-
-keepTurn :: Name -> Rule
-keepTurn p = 
-    withAction $ \a ->
-    doAfter $ \gs ->
-    let players = _players gs 
-        (l, r) = break (== p) players
-        n = length r 
-        n' = if actionAdvancesTurn a then n-1 else n -- usual case: if we advanced the turn, n=1, else n=0 (mod length ps) ; so the usual case is to set this to 0
-        gs' = modifyVar "BF_player_shift" (+n') gs
-    in  gs'{_players = r ++ l} 
-
-actionAdvancesTurn :: Action -> Bool
-actionAdvancesTurn (Draw n) = n > 0
-actionAdvancesTurn _ = True
--}
-
 var7 :: VarName
 var7 = "sevens"
-
 ignoreR7 :: Rule
 ignoreR7 = when (boolVar var7 ~&~ not_ (cardIs ((== Seven) . rank))) $
-    doBefore (copyVar var7 "BF_7_backup")
-  . doBefore (setVar var7 0)
-  . doAfter (copyVar "BF_7_backup" var7)
+    with (getVar var7) $ \v7 ->
+    doBefore (setVar var7 0)
+  . doAfter (setVar var7 v7)
 
 
 rInput :: Rule
 rInput = when (boolVar "BF_input") $
     withAction $ \a -> -- so we don't trigger on timeouts
-    whether isIntrPlayer (
+    whether isIntprPlayer (
         withMessage $ \m -> 
         ignoreR7
       . when (cardIs$ const True) (doOnly $ illegal 1 "Attempting to play while inputting")
@@ -279,13 +255,13 @@ rInput = when (boolVar "BF_input") $
                    . doBefore (setVar ("BF_mem" ! head) (cardToNum c))
                    . doBefore (setVar "BF_input" 0)
                    . doBefore (broadcast $ "{} inputs {}"%p%[uniCard c]) 
-    )(with getIntrPlayer $ \p -> doOnly $ illegal 1 $ "Attempting to {} while {} is inputting" % show a % p)
+    )(with getIntprPlayer $ \p -> doOnly $ illegal 1 $ "Attempting to {} while {} is inputting" % show a % p)
 
 rOutput :: Rule
 rOutput = 
     (when (boolVar "BF_output") $
          withAction $ \a -> -- don't trigger on timeouts
-         whether isIntrPlayer (
+         whether isIntprPlayer (
              withPlayer $ \p ->
              with (numToCard .: getVar "BF_output_card") $ \c ->
              ignoreR7
@@ -299,7 +275,7 @@ rOutput =
                      . makeInTurn p
                      )
                      (doOnly$ illegal 1 "Failure to output the correct card")
-          )(with getIntrPlayer $ \p -> doOnly $ illegal 1 $ "Attempting to {} while {} is outputting" % show a % p))
+          )(with getIntprPlayer $ \p -> doOnly $ illegal 1 $ "Attempting to {} while {} is outputting" % show a % p))
     . (when (boolVar "BF_output_cleanup" ~&~ isLegal) $ 
             doAfter (setVar "BF_output_cleanup" 0)
           . doAfter cleanupGhostCard)
@@ -324,7 +300,7 @@ cleanupGhostCard gs =
 -- Main rule --
 
 rBF :: Rule
-rBF = rDebug . rSetup . rAbort . rCards . rInput . rOutput . rInterpret
+rBF = rDebug . rSetup . rCatchEvents . rAbort . rCards . rInput . rOutput . rInterpret
 
 -- Veiws --
 
