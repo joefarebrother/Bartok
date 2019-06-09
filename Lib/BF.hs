@@ -24,13 +24,6 @@ bfToNum = maybe 0 id . flip elemIndex " +-<>,.[]"
 elemIndex x [] = Nothing
 elemIndex x (y:ys) = if x==y then Just 0 else fmap(+1) $ elemIndex x ys
 
-withPlayer :: (Name -> Rule) -> Rule
-withPlayer f act e@(Action p _ _) gs = f p act e gs
-withPlayer f act e gs = act e gs
-
-withHand :: ([Card] -> Rule) -> Rule
-withHand f = withPlayer $ \p -> with state $ \gs -> f (maybe [] id $ getHand p gs)
-
 (!) :: Show a => VarName -> a -> VarName 
 n ! x = n ++ "_" ++ show x
 
